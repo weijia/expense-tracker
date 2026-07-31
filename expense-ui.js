@@ -151,7 +151,7 @@
       svg.appendChild(_ns("text", {
         x: (leftX + rightX) / 2, y: (topY + bottomY) / 2,
         "text-anchor": "middle", "font-size": "13", fill: "#94a3b8"
-      }, "暂无数据");
+      }, "暂无数据"));
       mount.appendChild(svg);
       return;
     }
