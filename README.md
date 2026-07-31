@@ -285,13 +285,111 @@ date,itemName,categoryId,quantity,unit,unitPrice,totalPrice,currency,merchant,br
 - `tags` 用 `|` 分隔
 - 空字段留空
 
-#### `ExpenseCore.csvToRecords(csvText)` → `ExpenseRecord[]`
+#### `ExpenseCore.csvToRecords(csvText, options?)` → `ExpenseRecord[]`
 
 CSV → 记录数组（核心字段）。自动为每条记录生成 `id/createdAt/updatedAt`。
+
+**支持中文表头**（v1.1 新增）：内置默认中文映射（日期/商品名/单价/商家/品牌/规格/...）。
+**支持自定义 fieldMap**：用户传入的映射会与默认中文映射合并，可覆盖。
+
+```js
+// 1. 直接用中文表头，零配置
+const records = ExpenseCore.csvToRecords(`日期,商品名,单价,数量,商家
+2026-07-31,纯牛奶,3.5,2,盒马`);
+
+// 2. 自定义表头映射
+const records = ExpenseCore.csvToRecords(csvText, {
+  fieldMap: { "购买日": "date", "东西": "itemName", "店家": "merchant" }
+});
+
+// 3. 严格模式：遇到第一行坏行就抛错（默认是静默跳过）
+const records = ExpenseCore.csvToRecords(csvText, { skipInvalid: false });
+```
+
+#### `ExpenseCore.csvToRecordsSafe(csvText, options?)` → `{ records, errors }` (v1.1 新增)
+
+推荐用于 **UI 导入场景**：坏行不会中断，会收集到 `errors` 数组里返回。
+
+```js
+const { records, errors } = ExpenseCore.csvToRecordsSafe(csvText);
+// errors = [{ row: 5, reason: "必填字段缺失: itemName", raw: "..." }, ...]
+if (errors.length) {
+  // 在 UI 上展示错误明细表给用户看
+}
+```
 
 #### `ExpenseCore.recordsToCSV(records)` → `string`
 
 记录数组 → CSV 文本。
+
+#### `ExpenseCore.csvTemplate()` → `string` (v1.1 新增)
+
+生成 CSV 模板（表头 + 1 行示例），用于「下载模板」按钮。
+
+```js
+const tpl = ExpenseCore.csvTemplate();
+downloadBlob(tpl, "expense-template.csv", "text/csv");
+```
+
+---
+
+### 2.9 去重 / 预演（v1.1 新增）
+
+#### `ExpenseCore.dedupeKeyOf(record)` → `string`
+
+返回记录的业务去重键：`date|itemName|brand|specification|merchant`。同一天、同一商品、同一商家 → 视为重复。
+
+```js
+const k = ExpenseCore.dedupeKeyOf(record);
+// "2026-07-31|纯牛奶|特仑苏|250ml*12|盒马"
+```
+
+#### `ExpenseCore.findDuplicate(record, existingRecords, opts?)` → `ExpenseRecord | null`
+
+在已有记录里查找重复。
+
+| `opts.by` | 含义 |
+|----------|------|
+| `"dedupe"`（默认） | `date + itemName + brand + specification + merchant` 完全相同 |
+| `"id"` | 同 UUID |
+| `"compareKey"` | 同 `itemName + brand + specification`（忽略日期/商家，用于"同商品"判断） |
+
+```js
+const dup = ExpenseCore.findDuplicate(newRecord, data.records, { by: "dedupe" });
+if (dup) console.log("已存在相同记录");
+```
+
+#### `ExpenseCore.previewImport(newRecords, existingAppData, opts?)` → 预演结果
+
+**导入预演（dry-run）**：模拟合并，但不实际写入。返回分类后的明细，UI 直接渲染给用户确认。
+
+```js
+const preview = ExpenseCore.previewImport(csvRecords, currentData, {
+  dedupeBy: "dedupe"  // "dedupe" | "id" | "compareKey" | "none"
+});
+
+// preview 结构：
+// {
+//   toAdd: [...],         // 即将新增的记录
+//   toUpdate: [...],      // 即将覆盖更新的记录（同 id 但 updatedAt 较新）
+//   duplicates: [...],     // 重复被跳过的记录
+//   invalid: [{record, errors}],  // 校验失败的记录
+//   summary: {
+//     total, add, update, duplicate, invalid,
+//     addAmount  // 新增总金额
+//   }
+// }
+
+// UI 流程：
+// 1) 渲染 preview.summary 给用户看
+// 2) 用户点「确认导入」 → store.importRecords(preview.toAdd.concat(preview.toUpdate), "merge")
+```
+
+`dedupeBy` 选项：
+- `"dedupe"`（默认）: 按完整业务键去重（推荐）
+- `"compareKey"`: 只按商品比价键去重（同一商品不同日期也算重复）
+- `"id"`: 只按 UUID 去重（等价于原 merge 行为）
+- `"none"`: 不去重，全部视为新增
 
 ---
 
@@ -353,8 +451,31 @@ const store = await ExpenseStore.create({
 | `store.addRecord(record)` | `Promise<ExpenseRecord>` | 追加记录并保存 |
 | `store.updateRecord(id, updates)` | `Promise<ExpenseRecord \| null>` | 按 ID 更新并保存 |
 | `store.deleteRecord(id)` | `Promise<boolean>` | 按 ID 删除并保存 |
-| `store.importRecords(newRecords, mode)` | `Promise<AppData>` | 批量导入，mode=`merge`/`replace` |
+| `store.importRecords(newRecords, mode, opts?)` | `Promise<AppData>` | 批量导入，mode=`merge`/`replace`；`opts.dedupeBy="dedupe"` 可开启业务键去重 |
 | `store.replaceData(newData)` | `Promise<void>` | 整体替换 AppData 并保存 |
+
+### 3.3 推荐的导入流程（dry-run + 去重）
+
+```js
+const store = await ExpenseStore.create({ appId: "my-app" });
+await store.load();
+
+// 1. 解析 CSV（推荐 Safe 版，能拿到错误明细）
+const { records, errors } = ExpenseCore.csvToRecordsSafe(csvText);
+if (errors.length) { /* 展示给用户看 */ }
+
+// 2. 预演：看看会发生什么
+const preview = ExpenseCore.previewImport(records, store.getData(), {
+  dedupeBy: "dedupe"
+});
+console.log(`将新增 ${preview.summary.add} 条 / 更新 ${preview.summary.update} 条 / 跳过 ${preview.summary.duplicate} 条重复 / 非法 ${preview.summary.invalid} 条`);
+
+// 3. 用户确认后再真正写入
+const effective = preview.toAdd.concat(preview.toUpdate);
+await store.importRecords(effective, "merge");
+// 或者直接用带去重的导入（一步到位，不需要 preview）
+// await store.importRecords(records, "merge", { dedupeBy: "dedupe" });
+```
 
 ---
 
@@ -461,7 +582,7 @@ data.categories.push(myCategory);
 node test-expense-core.js
 ```
 
-测试覆盖：构造函数、校验、比价索引、分类汇总、JSON 导入导出（merge/replace）、CSV 双向转换等核心场景。
+测试覆盖：构造函数、校验、比价索引、分类汇总、JSON 导入导出（merge/replace）、CSV 双向转换、中文表头映射、错误收集、CSV 模板、去重、导入预演等 52 项核心场景。
 
 ## License
 

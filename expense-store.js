@@ -189,11 +189,37 @@
       if (removed) await this.save();
       return removed;
     }
-    async importRecords(newRecords, mode) {
+    /**
+     * 批量导入记录。
+     * @param {ExpenseRecord[]} newRecords
+     * @param {"merge"|"replace"} mode
+     * @param {object} [opts]
+     * @param {string} [opts.dedupeBy]  "dedupe"|"compareKey"|"none"
+     *   仅在 merge 模式下生效；指定后会对 newRecords 与现有记录做业务键去重，
+     *   重复的直接丢弃（不更新不新增）。不指定则走原 merge 行为（按 id 合并）。
+     */
+    async importRecords(newRecords, mode, opts) {
       const Core = _getCore();
       if (!this._data) await this.load();
       if (!Array.isArray(newRecords)) throw new Error("importRecords: 必须传入数组");
       const m = mode === "replace" ? "replace" : "merge";
+
+      // 去重路径：用 previewImport 选出真正要新增的，再走 merge 流程
+      if (m === "merge" && opts && opts.dedupeBy && opts.dedupeBy !== "none") {
+        const preview = Core.previewImport(newRecords, this._data, { dedupeBy: opts.dedupeBy });
+        // 把要更新的也带进去（merge 会按 id 选新版本）
+        const effective = preview.toAdd.concat(preview.toUpdate);
+        const fakeAppData = Core.createEmptyAppData();
+        fakeAppData.version = this._data.version;
+        fakeAppData.categories = this._data.categories.slice();
+        fakeAppData.records = effective;
+        const json = Core.exportJSON(fakeAppData);
+        this._data = Core.importJSON(json, "merge", this._data);
+        await this.save();
+        return this._data;
+      }
+
+      // 默认路径（保留原行为）
       const fakeAppData = Core.createEmptyAppData();
       fakeAppData.version = this._data.version;
       fakeAppData.categories = this._data.categories.slice();

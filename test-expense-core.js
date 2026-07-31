@@ -472,6 +472,195 @@ test("CSV → records → CSV 往返（去掉动态字段后等价）", () => {
   eq(p.tags, original[0].tags);
 });
 
+// ---------- 8b. CSV 中文表头映射 ----------
+console.log("\n8b. CSV 中文表头映射 (fieldMap)");
+test("默认支持中文表头", () => {
+  const csv = `日期,商品名,分类,数量,单位,单价,总价,货币,商家,品牌,规格,备注,标签
+2026-07-31,纯牛奶,cat_grocery,2,盒,3.5,7.0,CNY,盒马,特仑苏,250ml*12,促销,囤货|临期`;
+  const records = ExpenseCore.csvToRecords(csv);
+  eq(records.length, 1);
+  eq(records[0].itemName, "纯牛奶");
+  eq(records[0].brand, "特仑苏");
+  eq(records[0].specification, "250ml*12");
+  eq(records[0].unitPrice, 3.5);
+  eq(records[0].merchant, "盒马");
+  eq(records[0].tags, ["囤货", "临期"]);
+});
+test("fieldMap 用户自定义映射（覆盖默认）", () => {
+  const csv = `购买日,东西,店家,价格,数量
+2026-07-31,咖啡,Manner,15,1`;
+  const records = ExpenseCore.csvToRecords(csv, {
+    fieldMap: { "购买日": "date", "东西": "itemName", "店家": "merchant", "价格": "unitPrice", "数量": "quantity" }
+  });
+  eq(records.length, 1);
+  eq(records[0].date, "2026-07-31");
+  eq(records[0].itemName, "咖啡");
+  eq(records[0].merchant, "Manner");
+  eq(records[0].unitPrice, 15);
+});
+
+// ---------- 8c. CSV 错误收集 (csvToRecordsSafe) ----------
+console.log("\n8c. CSV 错误收集 (csvToRecordsSafe)");
+test("csvToRecordsSafe 返回 {records, errors}", () => {
+  const csv = `date,itemName,categoryId,quantity,unit,unitPrice,currency,merchant
+2026-07-31,牛奶,cat_grocery,1,盒,3.5,CNY,盒马
+2026-07-31,,cat_grocery,1,盒,3.5,CNY,京东`;
+  const r = ExpenseCore.csvToRecordsSafe(csv);
+  eq(r.records.length, 1);
+  ok(r.errors.length >= 1, `应有至少 1 条错误，实际: ${r.errors.length}`);
+  ok(r.errors[0].row >= 2, `错误行号应 ≥ 2`);
+  ok(typeof r.errors[0].reason === "string" && r.errors[0].reason.length > 0);
+});
+test("csvToRecordsSafe 空输入", () => {
+  const r = ExpenseCore.csvToRecordsSafe("");
+  eq(r.records.length, 0);
+  eq(r.errors.length, 0);
+});
+
+// ---------- 8d. CSV 模板 ----------
+console.log("\n8d. CSV 模板 (csvTemplate)");
+test("csvTemplate 返回表头 + 1 行示例", () => {
+  const tpl = ExpenseCore.csvTemplate();
+  const lines = tpl.split("\n");
+  eq(lines[0], "date,itemName,categoryId,quantity,unit,unitPrice,totalPrice,currency,merchant,brand,specification,note,tags");
+  ok(lines.length >= 2, "模板应至少含表头 + 1 行示例");
+  ok(lines[1].includes("纯牛奶"));
+  ok(lines[1].includes("cat_grocery"));
+});
+
+// ---------- 9. 去重 (findDuplicate / dedupeKeyOf) ----------
+console.log("\n9. 去重 (findDuplicate / dedupeKeyOf)");
+test("dedupeKeyOf 拼装业务键", () => {
+  const r = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", brand:"A", specification:"250ml",
+    merchant:"盒马", unitPrice:1, quantity:1
+  });
+  eq(ExpenseCore.dedupeKeyOf(r), "2026-07-31|牛奶|A|250ml|盒马");
+});
+test("findDuplicate by='dedupe' 命中", () => {
+  const existing = [ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", brand:"A", specification:"250ml",
+    merchant:"盒马", unitPrice:1, quantity:1
+  })];
+  const candidate = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", brand:"A", specification:"250ml",
+    merchant:"盒马", unitPrice:3.5, quantity:2  // 同一商家同一天同一商品
+  });
+  ok(ExpenseCore.findDuplicate(candidate, existing, { by: "dedupe" }) !== null);
+});
+test("findDuplicate by='dedupe' 不命中（不同商家）", () => {
+  const existing = [ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", merchant:"盒马",
+    unitPrice:1, quantity:1
+  })];
+  const candidate = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", merchant:"京东",
+    unitPrice:1, quantity:1
+  });
+  eq(ExpenseCore.findDuplicate(candidate, existing, { by: "dedupe" }), null);
+});
+test("findDuplicate by='id' 命中", () => {
+  const existing = [ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", merchant:"M",
+    unitPrice:1, quantity:1, id:"R-1"
+  })];
+  const candidate = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"咖啡", merchant:"M",
+    unitPrice:15, quantity:1, id:"R-1"
+  });
+  ok(ExpenseCore.findDuplicate(candidate, existing, { by: "id" }) !== null);
+});
+test("findDuplicate by='compareKey' 命中（忽略日期/商家）", () => {
+  const existing = [ExpenseCore.createRecord({
+    date:"2026-06-01", itemName:"牛奶", brand:"A", specification:"250ml",
+    merchant:"盒马", unitPrice:1, quantity:1
+  })];
+  const candidate = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", brand:"A", specification:"250ml",
+    merchant:"京东", unitPrice:3.5, quantity:2
+  });
+  ok(ExpenseCore.findDuplicate(candidate, existing, { by: "compareKey" }) !== null);
+});
+test("findDuplicate 空数组返回 null", () => {
+  const candidate = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"牛奶", merchant:"M",
+    unitPrice:1, quantity:1
+  });
+  eq(ExpenseCore.findDuplicate(candidate, []), null);
+  eq(ExpenseCore.findDuplicate(candidate, null), null);
+});
+
+// ---------- 10. 预演 (previewImport) ----------
+console.log("\n10. 导入预演 (previewImport)");
+test("previewImport 分类：新增 / 更新 / 重复 / 非法", () => {
+  const existing = [
+    ExpenseCore.createRecord({
+      date:"2026-07-01", itemName:"已有记录", categoryId:"cat_food",
+      merchant:"M", unitPrice:10, quantity:1, id:"R-EXIST"
+    })
+  ];
+  const data = ExpenseCore.createEmptyAppData();
+  data.records = existing;
+
+  const newRecords = [
+    // 1. 新增
+    ExpenseCore.createRecord({
+      date:"2026-07-31", itemName:"新商品", categoryId:"cat_food",
+      merchant:"M", unitPrice:5, quantity:1
+    }),
+    // 2. 同 id 但 updatedAt 较新 → 更新
+    Object.assign(ExpenseCore.createRecord({
+      date:"2026-07-01", itemName:"已有记录", categoryId:"cat_food",
+      merchant:"M", unitPrice:99, quantity:1, id:"R-EXIST"
+    }), { updatedAt: "2099-01-01T00:00:00.000Z" }),
+    // 3. 业务键重复（dedupe）→ 跳过
+    ExpenseCore.createRecord({
+      date:"2026-07-01", itemName:"已有记录", categoryId:"cat_food",
+      merchant:"M", unitPrice:88, quantity:1  // 同日同商品同商家
+    }),
+    // 4. 非法记录
+    { date: "2026-07-31", /* 缺 itemName */ categoryId:"cat_food",
+      merchant:"M", unitPrice:1, quantity:1, currency:"CNY", totalPrice:1, id:"BAD" }
+  ];
+
+  const preview = ExpenseCore.previewImport(newRecords, data, { dedupeBy: "dedupe" });
+  eq(preview.summary.total, 4);
+  eq(preview.summary.add, 1);
+  eq(preview.summary.update, 1);
+  eq(preview.summary.duplicate, 1);
+  eq(preview.summary.invalid, 1);
+  ok(preview.summary.addAmount === 5);
+  eq(preview.toAdd[0].itemName, "新商品");
+  eq(preview.toUpdate[0].id, "R-EXIST");
+  eq(preview.duplicates[0].unitPrice, 88);
+  eq(preview.invalid[0].errors.length > 0, true);
+});
+test("previewImport dedupeBy='none' 不做去重", () => {
+  const existing = [ExpenseCore.createRecord({
+    date:"2026-07-01", itemName:"A", merchant:"M", unitPrice:1, quantity:1
+  })];
+  const data = ExpenseCore.createEmptyAppData();
+  data.records = existing;
+  const newRecords = [ExpenseCore.createRecord({
+    date:"2026-07-01", itemName:"A", merchant:"M", unitPrice:2, quantity:1
+  })];
+  const preview = ExpenseCore.previewImport(newRecords, data, { dedupeBy: "none" });
+  eq(preview.summary.add, 1);   // 不去重 → 全是新增
+  eq(preview.summary.duplicate, 0);
+});
+test("previewImport newRecords 内部重复也算 duplicate", () => {
+  const data = ExpenseCore.createEmptyAppData();
+  const r1 = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"A", merchant:"M", unitPrice:1, quantity:1
+  });
+  const r2 = ExpenseCore.createRecord({
+    date:"2026-07-31", itemName:"A", merchant:"M", unitPrice:2, quantity:1
+  });
+  const preview = ExpenseCore.previewImport([r1, r2], data, { dedupeBy: "dedupe" });
+  eq(preview.summary.add, 1);
+  eq(preview.summary.duplicate, 1);
+});
+
 // ---------- 结果汇总 ----------
 console.log("\n========================================================");
 console.log(`📊 ${pass} 通过 · ${fail} 失败`);

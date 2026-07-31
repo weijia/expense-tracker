@@ -395,47 +395,261 @@
     return lines.join("\n");
   }
 
-  function csvToRecords(csvText) {
-    if (!csvText || typeof csvText !== "string") return [];
+  // 预置中文表头 → 英文字段映射（用户可在 csvToRecords({ fieldMap }) 覆盖/扩展）
+  const _DEFAULT_FIELD_MAP = {
+    "日期": "date",
+    "商品名": "itemName", "商品名称": "itemName", "品名": "itemName",
+    "分类": "categoryId", "分类ID": "categoryId",
+    "数量": "quantity",
+    "单位": "unit",
+    "单价": "unitPrice",
+    "总价": "totalPrice",
+    "货币": "currency",
+    "商家": "merchant", "渠道": "merchant",
+    "品牌": "brand",
+    "规格": "specification",
+    "备注": "note",
+    "标签": "tags"
+  };
+
+  // 把 CSV 表头归一化成英文字段名
+  //   1. 直接命中英文表头 → 用之
+  //   2. 命中 fieldMap（含默认中文映射 + 用户传入的）→ 用之
+  //   3. 否则保留原值（用户传未知列时也容错）
+  function _normalizeHeaders(headers, userFieldMap) {
+    const merged = Object.assign({}, _DEFAULT_FIELD_MAP, userFieldMap || {});
+    return headers.map(function (h) {
+      const trimmed = String(h || "").trim();
+      if (merged[trimmed]) return merged[trimmed];
+      return trimmed;
+    });
+  }
+
+  /**
+   * CSV → 记录数组。
+   * @param {string} csvText
+   * @param {object} [options]
+   * @param {object} [options.fieldMap]  表头映射，如 { "日期": "date", "商品名": "itemName" }
+   * @param {boolean} [options.skipInvalid=true]  遇到坏行是否静默跳过（false 时会抛错）
+   */
+  function csvToRecords(csvText, options) {
+    const result = _csvToRecordsInternal(csvText, options);
+    if (result.errors.length) {
+      // 兼容旧行为：默认静默跳过坏行
+      if (options && options.skipInvalid === false) {
+        throw new Error("csvToRecords: 第 " + result.errors[0].row + " 行解析失败 — " + result.errors[0].reason);
+      }
+    }
+    return result.records;
+  }
+
+  /**
+   * CSV → { records, errors }（推荐用于 UI 导入场景）
+   * @param {string} csvText
+   * @param {object} [options]  同 csvToRecords
+   * @returns {{ records: ExpenseRecord[], errors: Array<{row:number, reason:string, raw:string}> }}
+   */
+  function csvToRecordsSafe(csvText, options) {
+    return _csvToRecordsInternal(csvText, options);
+  }
+
+  function _csvToRecordsInternal(csvText, options) {
+    const opts = options || {};
+    const out = [];
+    const errors = [];
+    if (!csvText || typeof csvText !== "string") {
+      return { records: out, errors: errors };
+    }
     const rows = _parseCSV(csvText);
-    if (rows.length === 0) return [];
-    const headers = rows[0].map(function (h) { return h.trim(); });
+    if (rows.length === 0) return { records: out, errors: errors };
+
+    const rawHeaders = rows[0];
+    const headers = _normalizeHeaders(rawHeaders, opts.fieldMap);
     const headerIdx = {};
     for (let i = 0; i < headers.length; i++) headerIdx[headers[i]] = i;
-    const out = [];
+
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
+      const rowNo = i + 1; // 表头是第 1 行，所以数据行号从 2 开始
+      const raw = row.join(",");
       const get = function (k) {
         const idx = headerIdx[k];
         return idx === undefined ? "" : (row[idx] === undefined ? "" : String(row[idx]));
       };
-      const qty = Number(get("quantity"));
-      const up = Number(get("unitPrice"));
-      const tp = Number(get("totalPrice"));
-      const partial = {
-        date: get("date"),
-        itemName: get("itemName"),
-        categoryId: get("categoryId") || "cat_other",
-        quantity: isNaN(qty) ? 1 : qty,
-        unit: get("unit") || "个",
-        unitPrice: isNaN(up) ? 0 : up,
-        currency: get("currency") || DEFAULT_CURRENCY,
-        merchant: get("merchant") || "",
-        brand: get("brand") || undefined,
-        specification: get("specification") || undefined,
-        note: get("note") || undefined
-      };
-      if (!isNaN(tp) && tp > 0) partial.totalPrice = tp;
-      const tagsStr = get("tags");
-      if (tagsStr) {
-        const arr = tagsStr.split("|").map(function (s) { return s.trim(); }).filter(Boolean);
-        if (arr.length) partial.tags = arr;
+      try {
+        const qty = Number(get("quantity"));
+        const up = Number(get("unitPrice"));
+        const tp = Number(get("totalPrice"));
+        const partial = {
+          date: get("date"),
+          itemName: get("itemName"),
+          categoryId: get("categoryId") || "cat_other",
+          quantity: isNaN(qty) ? 1 : qty,
+          unit: get("unit") || "个",
+          unitPrice: isNaN(up) ? 0 : up,
+          currency: get("currency") || DEFAULT_CURRENCY,
+          merchant: get("merchant") || "",
+          brand: get("brand") || undefined,
+          specification: get("specification") || undefined,
+          note: get("note") || undefined
+        };
+        if (!isNaN(tp) && tp > 0) partial.totalPrice = tp;
+        const tagsStr = get("tags");
+        if (tagsStr) {
+          const arr = tagsStr.split("|").map(function (s) { return s.trim(); }).filter(Boolean);
+          if (arr.length) partial.tags = arr;
+        }
+        // 跳过完全空行
+        if (!partial.date && !partial.itemName && !partial.merchant) continue;
+
+        // 校验
+        const errs = validateRecord(createRecord(partial));
+        if (errs.length) {
+          errors.push({ row: rowNo, reason: errs.join("; "), raw: raw });
+          continue;
+        }
+        out.push(createRecord(partial));
+      } catch (e) {
+        errors.push({ row: rowNo, reason: e.message, raw: raw });
       }
-      // 跳过空行（无商品名无日期无分类）
-      if (!partial.date && !partial.itemName && !partial.merchant) continue;
-      out.push(createRecord(partial));
     }
-    return out;
+    return { records: out, errors: errors };
+  }
+
+  /**
+   * 生成 CSV 模板（表头 + 1 行示例），用于「下载模板」按钮。
+   */
+  function csvTemplate() {
+    const sample = createRecord({
+      date: "2026-07-31",
+      itemName: "纯牛奶",
+      categoryId: "cat_grocery",
+      quantity: 2,
+      unit: "盒",
+      unitPrice: 3.5,
+      merchant: "盒马",
+      brand: "特仑苏",
+      specification: "250ml*12",
+      note: "促销",
+      tags: ["囤货", "临期"]
+    });
+    return recordsToCSV([sample]);
+  }
+
+  // ============================================================
+  // 2.8 去重 / 预演（dry-run）
+  // ============================================================
+  // 默认去重 key：date + itemName + brand + specification + merchant
+  // 同一天、同一商品、同一商家 → 视为重复
+  function dedupeKeyOf(record) {
+    return [
+      record.date || "",
+      record.itemName || "",
+      record.brand || "",
+      record.specification || "",
+      record.merchant || ""
+    ].join("|");
+  }
+
+  /**
+   * 在已有记录中查找重复。
+   * @param {ExpenseRecord} record
+   * @param {ExpenseRecord[]} existingRecords
+   * @param {object} [opts]
+   * @param {string} [opts.by="dedupe"]  "dedupe" | "id" | "compareKey"
+   * @returns {ExpenseRecord | null}
+   */
+  function findDuplicate(record, existingRecords, opts) {
+    if (!record || !Array.isArray(existingRecords) || !existingRecords.length) return null;
+    const by = (opts && opts.by) || "dedupe";
+    if (by === "id") {
+      return existingRecords.find(function (r) { return r.id === record.id; }) || null;
+    }
+    if (by === "compareKey") {
+      const k = _compareKeyOf(record);
+      return existingRecords.find(function (r) { return _compareKeyOf(r) === k; }) || null;
+    }
+    // 默认 dedupe：date + itemName + brand + specification + merchant
+    const k = dedupeKeyOf(record);
+    return existingRecords.find(function (r) { return dedupeKeyOf(r) === k; }) || null;
+  }
+
+  /**
+   * 导入预演：模拟把 newRecords 合并进 existingAppData，但不实际写入。
+   * 返回分类后的明细，UI 直接渲染给用户确认。
+   *
+   * @param {ExpenseRecord[]} newRecords
+   * @param {AppData} existingAppData
+   * @param {object} [opts]
+   * @param {string} [opts.dedupeBy="dedupe"]  "dedupe" | "id" | "compareKey" | "none"
+   * @returns {{
+   *   toAdd: ExpenseRecord[],            // 新增（无重复）
+   *   toUpdate: ExpenseRecord[],          // 覆盖更新（同 id 但 updatedAt 较新）
+   *   duplicates: ExpenseRecord[],        // 重复跳过（dedupeBy 命中）
+   *   invalid: Array<{record:ExpenseRecord, errors:string[]}>,
+   *   summary: { total:number, add:number, update:number, duplicate:number, invalid:number, addAmount:number }
+   * }}
+   */
+  function previewImport(newRecords, existingAppData, opts) {
+    const existing = (existingAppData && Array.isArray(existingAppData.records))
+      ? existingAppData.records : [];
+    const dedupeBy = (opts && opts.dedupeBy) || "dedupe";
+
+    const toAdd = [];
+    const toUpdate = [];
+    const duplicates = [];
+    const invalid = [];
+
+    for (const r of newRecords) {
+      // 1. 先校验
+      const errs = validateRecord(r);
+      if (errs.length) { invalid.push({ record: r, errors: errs }); continue; }
+
+      // 2. id 重复 → 选 updatedAt 新的为更新
+      const sameId = existing.find(function (x) { return x.id === r.id; });
+      if (sameId) {
+        if ((r.updatedAt || "") >= (sameId.updatedAt || "")) {
+          toUpdate.push(r);
+        } else {
+          duplicates.push(r);
+        }
+        continue;
+      }
+
+      // 3. dedupeBy 检查（id 之外的业务键重复）
+      if (dedupeBy !== "none" && dedupeBy !== "id") {
+        const dup = findDuplicate(r, existing, { by: dedupeBy });
+        if (dup) {
+          duplicates.push(r);
+          continue;
+        }
+        // 还要检查 newRecords 内部是否已加过同 key
+        const internalDup = findDuplicate(r, toAdd, { by: dedupeBy });
+        if (internalDup) {
+          duplicates.push(r);
+          continue;
+        }
+      }
+
+      toAdd.push(r);
+    }
+
+    const addAmount = toAdd.reduce(function (s, r) { return s + (Number(r.totalPrice) || 0); }, 0);
+
+    return {
+      toAdd: toAdd,
+      toUpdate: toUpdate,
+      duplicates: duplicates,
+      invalid: invalid,
+      summary: {
+        total: newRecords.length,
+        add: toAdd.length,
+        update: toUpdate.length,
+        duplicate: duplicates.length,
+        invalid: invalid.length,
+        addAmount: _round2(addAmount)
+      }
+    };
   }
 
   // 简易 CSV 解析：支持双引号包裹、引号转义、换行
@@ -498,6 +712,12 @@
     importJSON: importJSON,
 
     csvToRecords: csvToRecords,
-    recordsToCSV: recordsToCSV
+    csvToRecordsSafe: csvToRecordsSafe,
+    recordsToCSV: recordsToCSV,
+    csvTemplate: csvTemplate,
+
+    dedupeKeyOf: dedupeKeyOf,
+    findDuplicate: findDuplicate,
+    previewImport: previewImport
   };
 }));
